@@ -1,172 +1,47 @@
-# x-tunnel
+# X-Tunnel — OpenWrt Stable Core (single-file Go)
 
-> **OpenWrt / Linux pure SOCKS5 build:** This repository's [openwrt branch](https://github.com/fsyllkn/x-tunnel/tree/openwrt) fixes a missing client-side `startListeners()` call. The prior Linux binary could establish WSS/smux sessions but did not open its configured SOCKS5 ports. The OpenWrt build starts its SOCKS5/HTTP/TCP listeners and skips GeoIP/GeoSite direct routing when TUN mode is off; it does not create Linux TUN devices or modify host routes/DNS. The default `main` branch remains unchanged.
->
-> **Versioned release:** [openwrt-socks5-v1](https://github.com/fsyllkn/x-tunnel/releases/tag/openwrt-socks5-v1) is published by GitHub Actions after the Linux amd64 local SOCKS5 greeting smoke test succeeds. Asset names are `x-tunnel-linux-amd64` and `x-tunnel-linux-arm64`. If the GitHub Action or release is not present/successful, do not treat this as a compiled or deployed fix. See [OpenWrt manager](https://github.com/fsyllkn/x-tunnel-cf-ip-autotest/tree/openwrt), menu 19, for guarded installation.
+This `openwrt` branch uses the **exact original source** supplied by the owner as `x-tunnel(1).go` (2,489 lines; Git blob SHA-1 `06555ffc42dc4f78f27f79f4157dc7dac36e70f1`). The original known-working Linux AMD64 ELF has SHA-256 `ae3a79a4d2a6a8d7e1377afb2e022c5ed75b0157a694fb6aead9d86ab873ccc2`, is Go 1.26.0 and uses only uuid v1.6.0, gorilla/websocket v1.5.3 and smux v1.5.57. Structural, import and function matches indicate this is the source family of the working binary; the compiled hashes may differ due to build environment.
 
+**Build from `./x-tunnel.go` exclusively. NEVER build `./cmd/x-tunnel` for this OpenWrt stable release.** That legacy directory is retained for comparison only; it uses another codebase that previously omitted SOCKS5 listener initialization, and also introduced GeoIP/GeoSite routing that this project does not need.
 
-x-tunnel is a WebSocket multiplex tunnel tool. It supports:
+## Features and limits
 
-- Server mode over `ws://` or `wss://`
-- Client local SOCKS5 / HTTP proxy
-- Multi-server failover, load balancing, and latency strategy
-- Web management panel on the client
-- Windows TUN mode with GeoIP / GeoSite split routing
-- Docker server deployment through GHCR image
+- Single WSS/WS + ECH + smux client supporting `-l socks5://127.0.0.1:PORT`, `-f wss://...`, `-token`, `-ip` with comma-separated CF IPs, `-n`, `-ech`, `-dns`, `-ips` and `-fallback`.
+- Each client process supplies SOCKS5, HTTP or TCP proxy listeners. It **does not** install TUN, transparent proxy, policy routing, GeoIP/GeoSite rules or DNS interception.
+- Compatible with the existing `fsyllkn/x-tunnel-cf-ip-autotest` supervisor: one process per node; typically 127.0.0.1 ports 32322 onwards, UID 29002.
+- The Go core itself does **not** perform CF IP speedtests, provider export or automatic IP replacement; the OpenWrt Python manager handles those separately.
+- Windows and other systems can use the CLI binary, but this source does not contain the GUI/TUN feature set from the unrelated later `cmd/` implementation.
 
-## Quick Server Deploy
+## Local Linux AMD64 build
 
-Recommended Docker one-click deploy on a Linux VPS:
+Requires Go **1.26.0**:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/caichengle666/x-tunnel/main/deploy-server.sh | sudo bash
+```sh
+go version
+go mod download
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+  go build -trimpath -ldflags="-s -w" -o x-tunnel-linux-amd64 ./x-tunnel.go
+go version -m ./x-tunnel-linux-amd64
 ```
 
-The script asks for:
+Do not replace a live `/usr/bin/x-tunnel` without backing it up and passing the local SOCKS5 listener smoke test. The known-working binary can remain in production indefinitely.
 
-```text
-Enter server token:
-Enter server port [8090]:
-Enter allowed client CIDR [0.0.0.0/0]:
+## Multi-platform artifacts
+
+GitHub Actions `.github/workflows/openwrt-socks5.yml` pins Go 1.26.0, builds the **same single-file source** with `CGO_ENABLED=0`, uploads executables and publishes versioned assets at:
+
+[openwrt-stable-go126-v1](https://github.com/fsyllkn/x-tunnel/releases/tag/openwrt-stable-go126-v1)
+
+Targets: linux amd64/arm64/386/armv5/armv6/armv7/mips64; android arm64; darwin amd64/arm64; dragonfly amd64; freebsd 386/amd64/arm/arm64; windows amd64/arm64 (Windows files end with `.exe`). Release is published only if the matrix builds and the Linux amd64 local SOCKS5 handshake smoke test pass. Cross-compilation is not a device-level connectivity test.
+
+## OpenWrt integration
+
+Use the `openwrt` branch of [x-tunnel-cf-ip-autotest](https://github.com/fsyllkn/x-tunnel-cf-ip-autotest/tree/openwrt), which can install versioned, independently preflight-verified Linux binaries after backing up the previous core. Avoid accidentally using the previous `openwrt-socks5-v1` release constructed from the later `cmd/x-tunnel` source.
+
+The verified local SOCKS5 test is:
+
+```sh
+netstat -lnt | grep 32322
+curl -q --noproxy '' --proxy socks5h://127.0.0.1:32322 \
+  --connect-timeout 8 --max-time 20 https://api.ipify.org
 ```
-
-Default server endpoint:
-
-```text
-ws://SERVER_IP:8090/tunnel
-```
-
-For Cloudflare Tunnel, publish the service URL as:
-
-```text
-http://localhost:8090
-```
-
-Then clients connect with:
-
-```text
-wss://your-domain.example/tunnel
-```
-
-More details: [README-docker.md](README-docker.md)
-
-### Server Web + WebSocket Port Reuse
-
-On the server, the Web management panel and WebSocket tunnel can share a single port:
-
-```text
-x-tunnel -l ws://0.0.0.0:8090/tunnel -token your-token
-```
-
-- `/tunnel` handles the WebSocket tunnel
-- `/` serves the server Web status page
-
-Port reuse happens automatically when:
-
-- The server `-l` address uses `ws://` or `wss://`
-- No separate `-web` flag is specified, or the `-web` port matches the tunnel port
-
-If you need the Web panel on a different port, use `-web` explicitly:
-
-```text
-x-tunnel -l ws://0.0.0.0:8090/tunnel -token your-token -web :9090
-```
-
-## Client Quick Start
-
-If no config file exists, the client auto-generates a default `config.json` on first run:
-
-```text
-listen:      socks5://127.0.0.1:1080,http://127.0.0.1:30001
-token:       123456
-web_listen:  :9090
-servers:     ws://127.0.0.1:8090/tunnel (token 123456)
-```
-
-You can then edit the token, servers, and other settings from the Web panel at `http://127.0.0.1:9090/`.
-
-Or run from a config file explicitly:
-
-
-```powershell
-x-tunnel-new.exe -config config.json -web :9090
-```
-
-Open the Web panel:
-
-```text
-http://127.0.0.1:9090/
-```
-
-Typical local listeners:
-
-```text
-SOCKS5: 127.0.0.1:1080
-HTTP:   127.0.0.1:1090
-```
-
-## Simple Local Test
-
-Server:
-
-```powershell
-x-tunnel-new.exe -l ws://127.0.0.1:8080/tunnel -token test123
-```
-
-Client:
-
-```powershell
-x-tunnel-new.exe -l socks5://127.0.0.1:1080 -f ws://127.0.0.1:8080/tunnel -token test123
-```
-
-Test:
-
-```powershell
-curl.exe --socks5 127.0.0.1:1080 http://ipinfo.io/ip
-```
-
-## Build
-
-```bash
-go build -o x-tunnel ./cmd/x-tunnel
-```
-
-Windows binary:
-
-```powershell
-go build -o x-tunnel-new.exe ./cmd/x-tunnel
-```
-
-GitHub Actions release artifacts are packaged as archives. The Windows amd64 package automatically downloads official Wintun `0.14.1` during CI and includes `wintun.dll` next to `x-tunnel.exe` for TUN mode.
-
-## Important Flags
-
-| Flag | Description |
-| --- | --- |
-| `-l` | Listen address, for example `socks5://127.0.0.1:1080` or `ws://0.0.0.0:8090/tunnel` |
-| `-f` | Server address for client mode |
-| `-token` | WebSocket authentication token |
-| `-config` | JSON config file path |
-| `-web` | Web panel listen address, for example `:9090` |
-| `-n` | WebSocket channel count |
-| `-tun` | Enable Windows TUN mode |
-| `-direct` | Direct routing rules for TUN mode |
-| `-proxy` | Proxy routing rules for TUN mode |
-| `-default` | TUN default route: `proxy` or `direct` |
-
-## Repository Layout
-
-```text
-cmd/x-tunnel/       Main Go package, client/server/Web/TUN code
-deploy-server.sh    One-click Docker server deploy
-Dockerfile          Server image build
-docker-compose.yml  Server compose example
-README-docker.md    Docker deployment guide
-```
-
-## Notes
-
-- Docker server deployment uses `ghcr.io/caichengle666/x-tunnel:latest`.
-- Server mode exposes `/tunnel` and `/` on the same port.
-- Server Web page is read-only; client management APIs are disabled in server mode.
-- Windows TUN mode requires administrator privileges and `wintun.dll` next to the executable. The GitHub Windows amd64 release package includes it automatically.

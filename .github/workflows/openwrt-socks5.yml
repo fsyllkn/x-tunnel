@@ -1,12 +1,13 @@
-name: OpenWrt pure SOCKS5 kernel
+name: Build proven X-Tunnel single-file core
 
 on:
   push:
     branches: [openwrt]
     paths:
-      - 'cmd/**'
+      - 'x-tunnel.go'
       - 'go.mod'
       - 'go.sum'
+      - 'Dockerfile'
       - '.github/workflows/openwrt-socks5.yml'
   workflow_dispatch:
 
@@ -15,89 +16,130 @@ permissions:
 
 jobs:
   build:
-    name: Build linux/${{ matrix.arch }}
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          - {name: linux-amd64, goos: linux, goarch: amd64}
+          - {name: linux-arm64, goos: linux, goarch: arm64}
+          - {name: linux-386, goos: linux, goarch: '386'}
+          - {name: linux-armv5, goos: linux, goarch: arm, goarm: '5'}
+          - {name: linux-armv6, goos: linux, goarch: arm, goarm: '6'}
+          - {name: linux-armv7, goos: linux, goarch: arm, goarm: '7'}
+          - {name: linux-mips64, goos: linux, goarch: mips64}
+          - {name: android-arm64, goos: android, goarch: arm64}
+          - {name: darwin-amd64, goos: darwin, goarch: amd64}
+          - {name: darwin-arm64, goos: darwin, goarch: arm64}
+          - {name: dragonfly-amd64, goos: dragonfly, goarch: amd64}
+          - {name: freebsd-386, goos: freebsd, goarch: '386'}
+          - {name: freebsd-amd64, goos: freebsd, goarch: amd64}
+          - {name: freebsd-arm, goos: freebsd, goarch: arm, goarm: '7'}
+          - {name: freebsd-arm64, goos: freebsd, goarch: arm64}
+          - {name: windows-amd64, goos: windows, goarch: amd64}
+          - {name: windows-arm64, goos: windows, goarch: arm64}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Use matching Go compiler
+        uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.26.0'
           cache: true
-      - name: Compile static Linux executable
+      - name: Validate preserved source and dependency manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object x-tunnel.go)" = '06555ffc42dc4f78f27f79f4157dc7dac36e70f1'
+          test "$(go version | awk '{print $3}')" = 'go1.26.0'
+          go mod download
+      - name: Cross-compile single-file core (NO ./cmd/x-tunnel)
+        shell: bash
         env:
-          GOOS: linux
-          GOARCH: ${{ matrix.arch }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm || '' }}
           CGO_ENABLED: '0'
         run: |
-          set -eu
+          set -euo pipefail
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o "dist/x-tunnel-linux-${GOARCH}" ./cmd/x-tunnel
-          file "dist/x-tunnel-linux-${GOARCH}"
-      - name: Smoke test SOCKS5 listener (amd64)
-        if: matrix.arch == 'amd64'
+          output="dist/x-tunnel-${{ matrix.name }}"
+          if [ "$GOOS" = windows ]; then output="${output}.exe"; fi
+          go build -trimpath -ldflags="-s -w" -o "$output" ./x-tunnel.go
+          ls -lh "$output"
+      - name: Smoke-test SOCKS5 listener without remote network
+        if: matrix.name == 'linux-amd64'
+        shell: bash
         run: |
-          set -eu
-          cd "$(mktemp -d)"
-          "$GITHUB_WORKSPACE/dist/x-tunnel-linux-amd64" \
-            -f 'ws://127.0.0.1:9/tunnel' -token test-token -n 1 \
-            -l 'socks5://127.0.0.1:34221' -web '' > client.log 2>&1 &
-          pid=$!
-          trap 'kill "$pid" 2>/dev/null || true' EXIT
-          python3 - <<'PY'
-          import socket, time
-          for attempt in range(100):
-              try:
-                  with socket.create_connection(("127.0.0.1", 34221), timeout=0.3) as sock:
-                      sock.sendall(b"\x05\x01\x00")
-                      sock.settimeout(1)
-                      assert sock.recv(2) == b"\x05\x00", "invalid SOCKS5 handshake"
-                  print("PASS: SOCKS5 TCP socket listens and accepts a handshake")
-                  break
-              except (OSError, AssertionError):
-                  time.sleep(0.1)
-          else:
-              raise SystemExit("FAIL: SOCKS5 port did not listen")
+          set -euo pipefail
+          python3 - "$GITHUB_WORKSPACE/dist/x-tunnel-linux-amd64" <<'PY'
+          import socket, subprocess, sys, time
+          binary = sys.argv[1]
+          with socket.socket() as s:
+              s.bind(("127.0.0.1", 0))
+              port = s.getsockname()[1]
+          command = [binary, "-f", "ws://127.0.0.1:9/test", "-token", "smoke",
+                     "-n", "1", "-l", "socks5://127.0.0.1:%d" % port]
+          proc = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+          try:
+              for attempt in range(100):
+                  if proc.poll() is not None:
+                      raise SystemExit("FAIL: core exited before SOCKS5 listener started")
+                  try:
+                      with socket.create_connection(("127.0.0.1", port), timeout=0.25) as sock:
+                          sock.settimeout(0.5)
+                          sock.sendall(b"\x05\x01\x00")
+                          if sock.recv(2) == b"\x05\x00":
+                              print("PASS: actual SOCKS5 listener and greeting")
+                              break
+                  except OSError:
+                      time.sleep(0.1)
+              else:
+                  raise SystemExit("FAIL: SOCKS5 listener did not accept a greeting")
+          finally:
+              if proc.poll() is None: proc.terminate()
+              try: proc.wait(timeout=3)
+              except subprocess.TimeoutExpired:
+                  proc.kill()
+                  proc.wait()
           PY
-          if grep -F '[TUN] geoip loaded' client.log; then
-            echo 'FAIL: proxy-only mode started GeoIP routing' >&2
-            exit 1
-          fi
-          grep -F 'SOCKS5 代理: 127.0.0.1:34221' client.log
-      - name: Upload kernel binary
+          go version -m dist/x-tunnel-linux-amd64
+          echo 'Reference ELF sha256: ae3a79a4d2a6a8d7e1377afb2e022c5ed75b0157a694fb6aead9d86ab873ccc2'
+          sha256sum dist/x-tunnel-linux-amd64
+      - name: Upload one raw executable
         uses: actions/upload-artifact@v4
         with:
-          name: x-tunnel-linux-${{ matrix.arch }}
-          path: dist/x-tunnel-linux-${{ matrix.arch }}
+          name: x-tunnel-${{ matrix.name }}
+          path: dist/x-tunnel-${{ matrix.name }}*
           if-no-files-found: error
 
   release:
-    name: Publish versioned OpenWrt binaries
-    needs: build
-    runs-on: ubuntu-latest
+    name: Publish validated multi-platform executables
+    needs: [build]
     if: github.ref == 'refs/heads/openwrt'
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all matrix binaries
+        uses: actions/download-artifact@v4
         with:
-          pattern: x-tunnel-linux-*
-          path: release/
+          pattern: x-tunnel-*
+          path: release
           merge-multiple: true
-      - name: Publish immutable release
+      - name: Publish fixed stable release (never overwrite)
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           REV: ${{ github.sha }}
         run: |
-          set -eu
-          tag='openwrt-socks5-v1'
+          set -euo pipefail
+          tag='openwrt-stable-go126-v1'
+          test -s release/x-tunnel-linux-amd64
+          test -s release/x-tunnel-linux-arm64
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; refusing to change an immutable binary."
+            echo "$tag already published. Do not silently replace stable binaries."
             exit 0
           fi
-          gh release create "$tag" release/x-tunnel-linux-amd64 release/x-tunnel-linux-arm64 \
+          gh release create "$tag" release/* \
             --target "$REV" \
-            --title 'OpenWrt SOCKS5 listener fix v1' \
-            --notes 'OpenWrt-only Linux kernels: local SOCKS5 listener restored; proxy-only mode skips GeoIP/GeoSite split routing. No TUN or system route changes.'
+            --title 'X-Tunnel stable single-file Go 1.26.0 (OpenWrt and multi-platform)' \
+            --notes 'Rebuilt from exact preserved 2489-line x-tunnel.go (git blob 06555ffc42dc4f78f27f79f4157dc7dac36e70f1). Pure SOCKS5 client with WSS/ECH/smux. No TUN, GeoIP or local route takeover. linux-amd64 listener smoke-tested on GitHub Actions; other platforms are cross-compiled, not device-tested.'
