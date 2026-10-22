@@ -356,10 +356,15 @@ func main() {
 		replaceClientPool(NewMultiPool(simpleCfg))
 	}
 
-	// Start Web GUI now that config + flags are resolved
-	// Initialize client-side routing (direct/proxy split for SOCKS5/HTTP)
+	// OpenWrt branch: SOCKS5/HTTP listeners are plain tunnel entrances. Do not
+	// download GeoIP/GeoSite or route any SOCKS5 destinations locally.
+	// Keep explicit TUN routing available only if it was requested.
 	if !isServer {
-		initClientRouting()
+		if tunMode {
+			initClientRouting()
+		} else {
+			defaultRouteDecision = DecisionProxy
+		}
 	}
 
 	startWebGUI()
@@ -387,6 +392,9 @@ func main() {
 		return
 	}
 
+	// Starting smux channels does not create a local SOCKS5 listener.
+	// Always start local listeners before blocking the main goroutine.
+	startListeners()
 	runTUNModeIfNeeded()
 
 	// Block main goroutine to keep process alive
