@@ -1,0 +1,103 @@
+name: OpenWrt pure SOCKS5 kernel
+
+on:
+  push:
+    branches: [openwrt]
+    paths:
+      - 'cmd/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/openwrt-socks5.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build linux/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Compile static Linux executable
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+        run: |
+          set -eu
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o "dist/x-tunnel-linux-${GOARCH}" ./cmd/x-tunnel
+          file "dist/x-tunnel-linux-${GOARCH}"
+      - name: Smoke test SOCKS5 listener (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          set -eu
+          cd "$(mktemp -d)"
+          "$GITHUB_WORKSPACE/dist/x-tunnel-linux-amd64" \
+            -f 'ws://127.0.0.1:9/tunnel' -token test-token -n 1 \
+            -l 'socks5://127.0.0.1:34221' -web '' > client.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          python3 - <<'PY'
+          import socket, time
+          for attempt in range(100):
+              try:
+                  with socket.create_connection(("127.0.0.1", 34221), timeout=0.3) as sock:
+                      sock.sendall(b"\x05\x01\x00")
+                      sock.settimeout(1)
+                      assert sock.recv(2) == b"\x05\x00", "invalid SOCKS5 handshake"
+                  print("PASS: SOCKS5 TCP socket listens and accepts a handshake")
+                  break
+              except (OSError, AssertionError):
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("FAIL: SOCKS5 port did not listen")
+          PY
+          if grep -F '[TUN] geoip loaded' client.log; then
+            echo 'FAIL: proxy-only mode started GeoIP routing' >&2
+            exit 1
+          fi
+          grep -F 'SOCKS5 代理: 127.0.0.1:34221' client.log
+      - name: Upload kernel binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: x-tunnel-linux-${{ matrix.arch }}
+          path: dist/x-tunnel-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish versioned OpenWrt binaries
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/openwrt'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: x-tunnel-linux-*
+          path: release/
+          merge-multiple: true
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REV: ${{ github.sha }}
+        run: |
+          set -eu
+          tag='openwrt-socks5-v1'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to change an immutable binary."
+            exit 0
+          fi
+          gh release create "$tag" release/x-tunnel-linux-amd64 release/x-tunnel-linux-arm64 \
+            --target "$REV" \
+            --title 'OpenWrt SOCKS5 listener fix v1' \
+            --notes 'OpenWrt-only Linux kernels: local SOCKS5 listener restored; proxy-only mode skips GeoIP/GeoSite split routing. No TUN or system route changes.'
