@@ -1,5 +1,10 @@
 # x-tunnel
 
+> **OpenWrt / Linux pure SOCKS5 build:** This repository's [openwrt branch](https://github.com/fsyllkn/x-tunnel/tree/openwrt) fixes a missing client-side `startListeners()` call. The prior Linux binary could establish WSS/smux sessions but did not open its configured SOCKS5 ports. The OpenWrt build starts its SOCKS5/HTTP/TCP listeners and skips GeoIP/GeoSite direct routing when TUN mode is off; it does not create Linux TUN devices or modify host routes/DNS. The default `main` branch remains unchanged.
+>
+> **Versioned release:** [openwrt-socks5-v1](https://github.com/fsyllkn/x-tunnel/releases/tag/openwrt-socks5-v1) is published by GitHub Actions after the Linux amd64 local SOCKS5 greeting smoke test succeeds. Asset names are `x-tunnel-linux-amd64` and `x-tunnel-linux-arm64`. If the GitHub Action or release is not present/successful, do not treat this as a compiled or deployed fix. See [OpenWrt manager](https://github.com/fsyllkn/x-tunnel-cf-ip-autotest/tree/openwrt), menu 19, for guarded installation.
+
+
 x-tunnel is a WebSocket multiplex tunnel tool. It supports:
 
 - Server mode over `ws://` or `wss://`
